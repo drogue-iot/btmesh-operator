@@ -4,7 +4,7 @@ metadata:
   name: btmesh-operator
   labels:
     app.kubernetes.io/name: btmesh-operator
-    app.kubernetes.io/instance: eclipsecon-2022
+    app.kubernetes.io/instance: drogue-iot
     app.kubernetes.io/component: btmesh-operator
   annotations:
     image.openshift.io/triggers: |
@@ -22,13 +22,13 @@ spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: btmesh-operator
-      app.kubernetes.io/instance: eclipsecon-2022
+      app.kubernetes.io/instance: drogue-iot
       app.kubernetes.io/component: btmesh-operator
   template:
     metadata:
       labels:
         app.kubernetes.io/name: btmesh-operator
-        app.kubernetes.io/instance: eclipsecon-2022
+        app.kubernetes.io/instance: drogue-iot
         app.kubernetes.io/component: btmesh-operator
     spec:
       containers:
