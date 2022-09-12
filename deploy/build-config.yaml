@@ -10,11 +10,9 @@ spec:
   source:
     git:
       ref: main
-      uri: https://github.com/eclipse-iot/eclipsecon-2022-hackathon.git
+      uri: https://github.com/drogue-iot/btmesh-operator.git
     type: Git
   strategy:
-    dockerStrategy:
-      dockerfilePath: btmesh-operator/Dockerfile
     type: Docker
   triggers:
   - type: ConfigChange
