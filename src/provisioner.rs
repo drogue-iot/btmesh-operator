@@ -91,7 +91,10 @@ impl Operator {
                     log::debug!("Device state: {:?}", device);
                     if let Some(address) = &status.address {
                         if let Ok(command) = serde_json::to_vec(&BtMeshCommand {
-                            command: BtMeshOperation::Reset { address: *address },
+                            command: BtMeshOperation::Reset {
+                                address: *address,
+                                device: device.metadata.name.clone(),
+                            },
                         }) {
                             let message = mqtt::Message::new(topic, &command[..], 1);
                             if let Err(e) = self.client.publish(message).await {
@@ -340,7 +343,7 @@ pub enum BtMeshOperation {
     #[serde(rename = "provision")]
     Provision { device: String },
     #[serde(rename = "reset")]
-    Reset { address: u16 },
+    Reset { device: String, address: u16 },
 }
 
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq, Clone)]
