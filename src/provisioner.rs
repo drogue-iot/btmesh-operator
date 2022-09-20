@@ -251,7 +251,11 @@ impl Operator {
                                     let device =
                                         self.registry.get_device(&self.application, device).await;
                                     if let Ok(Some(mut device)) = device {
-                                        device.metadata.ensure_finalizer("btmesh-operator");
+                                        let mut updated = false;
+                                        if device.metadata.deletion_timestamp.is_none() {
+                                            updated |=
+                                                device.metadata.ensure_finalizer("btmesh-operator");
+                                        }
                                         let mut status: BtMeshStatus = if let Some(Ok(status)) =
                                             device.section::<BtMeshStatus>()
                                         {
@@ -263,7 +267,6 @@ impl Operator {
                                             }
                                         };
 
-                                        let mut updated = false;
                                         match &event.status {
                                             BtMeshDeviceState::Reset { device: _, error } => {
                                                 if let Some(error) = error {
