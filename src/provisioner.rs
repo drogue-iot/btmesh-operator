@@ -6,9 +6,11 @@ use drogue_client::{
     registry::v1::Device,
     Section, Translator,
 };
+use std::collections::HashSet;
 use futures::stream::StreamExt;
 use paho_mqtt as mqtt;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 use tokio::{join, time::Duration};
 
 pub type DrogueClient = drogue_client::registry::v1::Client;
@@ -17,6 +19,7 @@ pub struct Operator {
     client: mqtt::AsyncClient,
     group_id: Option<String>,
     application: String,
+    gateways: Mutex<Vec<String>>,
     registry: DrogueClient,
     interval: Duration,
 }
@@ -35,6 +38,21 @@ impl Operator {
             application,
             registry,
             interval,
+            gateways: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub async fn publish_gateways(&self, command: BtMeshCommand) {
+        if let Ok(command) = serde_json::to_vec(&command) {
+            let gws = self.gateways.lock().await;
+            for gw in gws.iter() {
+                let topic = format!("command/{}/{}/btmesh", self.application, gw);
+                log::info!("Sending command to gateway {}", gw);
+                let message = mqtt::Message::new(topic, &command[..], 1);
+                if let Err(e) = self.client.publish(message).await {
+                    log::warn!("Error publishing command back to device: {:?}", e);
+                }
+            }
         }
     }
 
@@ -51,11 +69,6 @@ impl Operator {
                         }
                     };
 
-                let topic = format!(
-                    "command/{}/{}/btmesh",
-                    self.application, device.metadata.name,
-                );
-                log::info!("Using topic {} for commands", topic);
                 let uuid = spec.device.to_ascii_lowercase();
                 let mut updated = false;
                 updated |= Self::ensure_alias(device, &uuid);
@@ -71,16 +84,13 @@ impl Operator {
                             "Sending provisioning command to device {}",
                             device.metadata.name
                         );
-                        if let Ok(command) = serde_json::to_vec(&BtMeshCommand {
+
+                        self.publish_gateways(BtMeshCommand {
                             command: BtMeshOperation::Provision {
                                 device: uuid.clone(),
                             },
-                        }) {
-                            let message = mqtt::Message::new(topic, &command[..], 1);
-                            if let Err(e) = self.client.publish(message).await {
-                                log::warn!("Error publishing command back to device: {:?}", e);
-                            }
-                        }
+                        })
+                        .await;
                     }
                 } else {
                     self.update_device(device, status.clone(), updated).await;
@@ -90,17 +100,13 @@ impl Operator {
                     );
                     log::debug!("Device state: {:?}", device);
                     if let Some(address) = &status.address {
-                        if let Ok(command) = serde_json::to_vec(&BtMeshCommand {
+                        let command = BtMeshCommand {
                             command: BtMeshOperation::Reset {
                                 address: *address,
                                 device: device.metadata.name.clone(),
                             },
-                        }) {
-                            let message = mqtt::Message::new(topic, &command[..], 1);
-                            if let Err(e) = self.client.publish(message).await {
-                                log::warn!("Error publishing command back to device: {:?}", e);
-                            }
-                        }
+                        };
+                        self.publish_gateways(command).await;
                     }
                 }
             }
@@ -134,6 +140,7 @@ impl Operator {
 
     pub async fn reconcile_devices(&self) {
         log::info!("Reconciling devices with interval {:?}", self.interval);
+
         loop {
             let devices = self
                 .registry
@@ -141,7 +148,16 @@ impl Operator {
                 .await
                 .unwrap_or(None)
                 .unwrap_or(Vec::new());
-
+            let mut gateways = Vec::new();
+            for device in devices.iter() {
+                if let Some("gateway") = device.metadata.labels.get("role").map(|s| s.as_str()) {
+                    gateways.push(device.metadata.name.clone());
+                }
+            }
+            let mut gws = self.gateways.lock().await;
+            log::info!("Loaded gateways: {:?}", gateways);
+            *gws = gateways;
+            drop(gws);
             self.provision_devices(devices).await;
             tokio::time::sleep(self.interval).await;
         }
@@ -161,6 +177,32 @@ impl Operator {
         let stream = self.client.get_stream(100);
         join!(self.reconcile_devices(), self.process_events(stream));
         Ok(())
+    }
+
+    async fn lookup_device(&self, device: &str) -> Option<Device> {
+        self.registry
+            .list_devices(&self.application, None)
+            .await
+            .unwrap_or(None)
+            .unwrap_or(Vec::new())
+            .iter()
+            .find(|d| {
+                let aliases: HashSet<String> = d
+                    .spec
+                    .get("alias")
+                    .map(|s| {
+                        if let Some(v) = s.as_array() {
+                            v.iter()
+                                .map(|e| e.as_str().map(|s| s.to_string()))
+                                .flatten()
+                                .collect()
+                        } else {
+                            HashSet::new()
+                        }
+                    })
+                    .unwrap_or(HashSet::new());
+                d.metadata.name == device || aliases.contains(device)
+            }).map(|d| d.clone())
     }
 
     fn ensure_alias(device: &mut Device, alias: &str) -> bool {
@@ -202,17 +244,12 @@ impl Operator {
                 if let Some(m) = m {
                     match serde_json::from_slice::<Event>(m.payload()) {
                         Ok(e) => {
-                            let mut device = String::new();
                             let mut subject = String::new();
                             for a in e.iter() {
                                 log::trace!("Attribute {:?}", a);
                                 if a.0 == "subject" {
                                     if let AttributeValue::String(s) = a.1 {
                                         subject = s.to_string();
-                                    }
-                                } else if a.0 == "device" {
-                                    if let AttributeValue::String(d) = a.1 {
-                                        device = d.to_string();
                                     }
                                 }
                             }
@@ -239,18 +276,22 @@ impl Operator {
 
                                 if let Some(event) = event {
                                     // Reset events are not sent on behalf of devices
-                                    let device =
-                                        if let BtMeshDeviceState::Reset { device, error: _ } =
-                                            &event.status
-                                        {
+                                    let device = match &event.status {
+                                        BtMeshDeviceState::Reset { device, error: _ } => {
                                             device.clone()
-                                        } else {
-                                            device
-                                        };
+                                        }
+                                        BtMeshDeviceState::Provisioned { device, address: _ } => {
+                                            device.clone()
+                                        }
+                                        BtMeshDeviceState::Provisioning { device, error: _ } => {
+                                            device.clone()
+                                        }
+                                    };
 
-                                    let device =
-                                        self.registry.get_device(&self.application, device).await;
-                                    if let Ok(Some(mut device)) = device {
+                                    log::debug!("Lookup device {}", device);
+                                    let device = self.lookup_device(&device).await;
+
+                                    if let Some(mut device) = device {
                                         let mut updated = false;
                                         if device.metadata.deletion_timestamp.is_none() {
                                             updated |=
@@ -266,6 +307,7 @@ impl Operator {
                                                 conditions: Default::default(),
                                             }
                                         };
+                                        log::debug!("Found device! Original status: {:?}", status);
 
                                         match &event.status {
                                             BtMeshDeviceState::Reset { device: _, error } => {
@@ -279,6 +321,7 @@ impl Operator {
                                                         .conditions
                                                         .update("Provisioned", condition);
                                                     status.conditions.update("Provisioning", false);
+                                                    updated = true;
                                                 } else {
                                                     status.conditions.update("Provisioned", false);
                                                     status.conditions.update("Provisioning", false);
@@ -289,15 +332,22 @@ impl Operator {
                                                 }
                                             }
                                             // If we're provisioned, update the status and insert alias in spec if its not already there
-                                            BtMeshDeviceState::Provisioned { address } => {
+                                            BtMeshDeviceState::Provisioned {
+                                                device: _,
+                                                address,
+                                            } => {
                                                 status.conditions.update("Provisioned", true);
                                                 status.conditions.update("Provisioning", false);
                                                 status.address = Some(*address);
                                                 let a = address.to_be_bytes();
                                                 let alias = format!("{:02x}{:02x}", a[0], a[1]);
-                                                updated |= Self::ensure_alias(&mut device, &alias);
+                                                Self::ensure_alias(&mut device, &alias);
+                                                updated = true;
                                             }
-                                            BtMeshDeviceState::Provisioning { error } => {
+                                            BtMeshDeviceState::Provisioning {
+                                                device: _,
+                                                error,
+                                            } => {
                                                 // If we're provisioned, we cant move back to being provisioning!
                                                 if status.address.is_none() {
                                                     status.conditions.update("Provisioning", true);
@@ -315,6 +365,7 @@ impl Operator {
                                                 }
                                             }
                                         }
+                                        log::debug!("Going to update device. Device: {:?}. Status: {:?} Updated {:?}", device, status, updated);
                                         self.update_device(&mut device, status, updated).await;
                                     }
                                 }
@@ -352,10 +403,13 @@ pub enum BtMeshOperation {
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq, Clone)]
 pub enum BtMeshDeviceState {
     #[serde(rename = "provisioning")]
-    Provisioning { error: Option<String> },
+    Provisioning {
+        device: String,
+        error: Option<String>,
+    },
 
     #[serde(rename = "provisioned")]
-    Provisioned { address: u16 },
+    Provisioned { device: String, address: u16 },
 
     #[serde(rename = "reset")]
     Reset {

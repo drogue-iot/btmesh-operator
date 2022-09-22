@@ -73,7 +73,7 @@ async fn main() -> anyhow::Result<()> {
         .client_id("btmesh-operator")
         .persistence(mqtt::PersistenceType::None)
         .finalize();
-    let mut mqtt_client = mqtt::AsyncClient::new(mqtt_opts)?;
+    let mqtt_client = mqtt::AsyncClient::new(mqtt_opts)?;
 
     let tp = AccessTokenProvider {
         user: args.user.to_string(),
